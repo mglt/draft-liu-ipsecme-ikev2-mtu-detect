@@ -1,7 +1,7 @@
 ---
 title: IKEv2 Link Maximum Atomic Packet and Packet Too Big Notification Extension
 abbrev: LMTA and PTB Notification
-docname: draft-liu-ipsecme-ikev2-mtu-dect-07
+docname: draft-liu-ipsecme-ikev2-mtu-dect-09
 ipr: trust200902
 stream: IETF
 area: Security
