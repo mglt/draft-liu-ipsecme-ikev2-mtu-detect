@@ -1,6 +1,6 @@
 ---
 title: IKEv2 Link Maximum Atomic Packet and Packet Too Big Notification Extension
-abbrev: LMTA and PTB Notification
+abbrev: LMAP and PTB Notification
 docname: draft-liu-ipsecme-ikev2-mtu-dect-11
 ipr: trust200902
 stream: IETF
@@ -40,23 +40,61 @@ author:
 
 --- abstract
 
-This document defines the IKEv2 Link Maximum Atomic Packet and Packet Too Big Extension to limit reassembly operations being performed by the egress security gateway.
+This document defines IKEv2 extensions that enable an egress security gateway to notify its ingress counterpart when IP fragmentation is detected on the tunnel link or when a received packet is too large for IPsec decapsulation.
 
-This extension enables an egress security gateway to notify its ingress counterpart that fragmentation is happening or that the received (and potentially reassembled) ESP packet is too big and thus cannot be decrypted.
-In both cases, the egress node provides Maximum Transmission Unit (MTU) information.
-Such information enables the ingress node to configure appropriately its Tunnel Maximum Transmission Unit - also designated as MTU or Tunnel MTU (TMTU) - to prevent fragmentation or too big packets to be transmitted.
+Two notification types are introduced.
+The Link Maximum Atomic Packet (LMAP) notification conveys the IP version and fragment length observed at the egress node, enabling the ingress node to derive the largest packet size that traverses the tunnel link without fragmentation.
+The Packet Too Big (PTB) notification conveys the Link MTU (LMTU) and the effective MTU to receive (EMTU_R) of the egress node, enabling the ingress node to determine the maximum packet size that the egress node can accept for IPsec processing.
+
+Together, these notifications enable the ingress node to set its Tunnel MTU (TMTU) so that reassembly at the egress node is avoided and oversized packets are not transmitted.
 
 --- middle
 
 # Introduction {#sec1}
 
-Reassembling fragments at the egress security gateway requires additional resources which under heavy load results in service degradations.
-Then, as detailed in {{?RFC4963}}, {{!RFC6864}} or {{!RFC8900}}, fragmentation is considered fragile and not sufficiently robust at high data rates.
-Typically, the 16-bit IPv4 identification field is not large enough to prevent duplication making fragmentation not sufficiently robust at high data rates.
-In IPv6 the 32 byte identification field reduces such collisions.
+## Problem Statement {#sec-problem}
+
+Reassembling IP fragments at the egress security gateway of an IPsec tunnel is resource-intensive and fragile.
+As detailed in {{?RFC4963}}, {{!RFC6864}}, and {{!RFC8900}}, IP fragmentation does not scale well at high data rates: the 16-bit IPv4 identification field is too small to prevent fragment misassociation, and hardware-accelerated security gateways may be unable to process reassembled packets that exceed the capacity of their crypto engine.
+
+Despite these problems, existing mechanisms are insufficient to prevent fragmentation:
+
+* Setting the IPv4 Don't Fragment bit (DF=1) avoids fragmentation but introduces black-hole risks.
+  On-path routers that cannot forward the packet silently drop it if they do not generate ICMP Packet Too Big (PTB) messages, or if such messages are blocked by firewalls (see {{sec-df1}} for a detailed discussion).
+
+* ICMP PTB messages, even when delivered, may not carry enough information for the ingress node to identify the affected Security Association (SA).
+  When ESP is encapsulated in UDP or TCP, the "Internet Header + 64 bits of Original Data" field in the ICMPv4 PTB message contains the UDP or TCP header rather than the ESP SPI (see {{sec-df1}}).
+
+* The egress node's effective MTU to receive (EMTU_R) — the maximum size of an IPsec-protected packet that the egress node can accept for decapsulation — is a local configuration parameter that is not communicated by any existing mechanism.
+
+## Approach
+
+This document addresses these gaps by defining two IKEv2 notification types that are exchanged over the authenticated IKEv2 channel:
+
+* A Link Maximum Atomic Packet (LMAP) notification, sent when the egress node detects that a received Tunnel Link Packet (TLP) has been fragmented.
+  This notification conveys the IP version and fragment length, enabling the ingress node to derive the Tunnel Maximum Atomic Packet (TMAP) — the largest Tunnel Transit Packet (TTP) size that avoids fragmentation on the tunnel link.
+
+* A Packet Too Big (PTB) notification, sent when a received (and potentially reassembled) TLP exceeds the EMTU_R and cannot be decapsulated.
+  This notification conveys both the LMTU and EMTU_R, enabling the ingress node to set its TMTU so that future packets are neither fragmented nor dropped.
+
+The LMAP and PTB notifications are carried exclusively over the authenticated IKEv2 channel.
+Any ICMP PTB messages that the egress node may independently generate are a separate mechanism and are not relied upon by this specification.
+
+Upon receiving these notifications, the ingress node adjusts its TMTU and, for IPv4 TTP with DF=0, performs inner fragmentation to prevent reassembly at the egress node.
+
+## Scope
+
+This document is focused on providing fragmentation-related information from the egress node to the ingress node and specifying how the ingress node uses this information.
+This document does not define a Path MTU Discovery (PMTUD) procedure {{!RFC1191}} or a Packetization Layer PMTUD (PLPMTUD) procedure {{!RFC4821}}.
+PLPMTUD for IPsec has been explored in {{?I-D.spiriyath-ipsecme-dynamic-ipsec-pmtu}}.
+End-to-end PMTUD between the original source and destination is independent and out of scope.
+
+The extension follows {{!RFC8900}}'s recommendation that each layer should handle fragmentation at its own layer and reduce reliance on IP fragmentation to the greatest degree possible.
+
+## Terminology Overview
 
 {{fig-frag}} depicts various fragmentation scenarios that can occur when Tunnel Transit Packets (TTP) are encapsulated over an IPsec tunnel.
-The IPsec packets exchanged between the ingress and the egress security gateway are designated as Tunnel Link Packet (TLP).
+The IPsec packets exchanged between the ingress and the egress security gateway are designated as Tunnel Link Packets (TLP).
 
 ~~~
 Source          Security             Security             Destination
@@ -80,8 +118,8 @@ Sender       (Ingress node)        (Egress node)          Receiver
                 |IPi|IPe|ESP|IPs|IPd|Data| Tunnel Link Packet
                 +---+---+---+---+---+----+       (TLP)
 
-2) Mid-tunnel (performed by a router on N)
-  (only for IPv4 DF=0  TLP)
+2) Mid-tunnel fragmentation (performed by a router on N)
+  (only for IPv4 DF=0 TLP)
                          +---+---+---+---+---+--+
                          |IPi|IPe|ESP|IPs|IPd|Da| (TLP)
                          +---+---+---+---+---+--+
@@ -118,26 +156,27 @@ Sender       (Ingress node)        (Egress node)          Receiver
 +---+---+--+
 
 ~~~
-{: #fig-frag title="Illustration of Different Type of Fragmentation.
-IPs (resp. IPi, IPe, IPd) designates the IP addresse of the Source, (resp. the Ingress node, the Egress node, the Destination).
+{: #fig-frag title="Illustration of Different Types of Fragmentation.
+IPs (resp. IPi, IPe, IPd) designates the IP address of the Source (resp. the Ingress node, the Egress node, the Destination).
 The IPsec tunnel is considered as an ESP tunnel.
 The IP payload is represented as 'Data'.
-Fragmentation is illustrated in splicing 'Data' into 'Da' and 'ta'.
-The figure does not show a difference between Data being encrypted or not, and the presence of the ESP header indicates the payload is encrypted." }
+Fragmentation is illustrated by splicing 'Data' into 'Da' and 'ta'.
+The figure does not distinguish encrypted from unencrypted Data; the presence of the ESP header indicates the payload is encrypted." }
 
-Reassembling is performed by the egress node in two cases.
-Firstly when mid tunnel fragmentation happens (see 2) {{fig-frag}}) -- in which case the TLP header or outer header is using IPv4 with its Do not Fragment bit set to 0 (DF=0).
-Secondly when Outer fragmentation is performed by the ingress node (see 4 in {{fig-frag}}).
-The main difference between the two scenarios is that with Outer fragmentation, the ingress node is aware that the egress performs some reassembly operations.
-Note also that in both cases, reassembling the TLP in itself does not prevent the TTP to be processed by IPsec unless the reassembled TLP exceeds the effective MTU to receive (EMTU_R) - that is the maximum size of the IPsec protected packet that can be accepted by the egress node to perform the ESP encapsulation.
+Reassembly is performed by the egress node in two cases.
+First, when mid-tunnel fragmentation occurs (see (2) in {{fig-frag}}) — in which case the TLP outer header uses IPv4 with its Don't Fragment bit set to 0 (DF=0).
+Second, when outer fragmentation is performed by the ingress node (see (4) in {{fig-frag}}).
+The main difference is that with outer fragmentation, the ingress node is aware that the egress will perform reassembly.
+In both cases, reassembly of the TLP does not prevent the TTP from being processed by IPsec, unless the reassembled TLP exceeds the EMTU_R.
 
+{{fig-esp-frag}} summarizes the operations performed by the egress node as a function of the TLP size.
+The optimal TTP size is the maximum that avoids fragmentation; the corresponding TTP size is designated as the Tunnel Maximum Atomic Packet (TMAP).
+The resulting TLP (after IPsec encapsulation) is the Link Maximum Atomic Packet (LMAP).
+The difference between TMAP and LMAP is the IPsec encapsulation overhead.
 
-{{fig-esp-frag}} summarizes the various operations performed by the egress node according to the size of an IPsec encapsulated TTP.
-The optimal size of the TTP is the maximum TTP size that avoids fragmentation and the corresponding TTP size is designated as Tunnel maximum atomic packet (TMAP).
-The resulting IPsec encapsulated TTP (or LTP) is designated as Link maximum atomic packet (LMAP) LTP. The difference between the two sizes is related to the IPsec encapsulation overhead.
-LTP smaller than the LMAP will not generate any fragmentation. LTP larger than the LMAP, but smaller than the EMTU_R will be fragmented and reassembled by the egress node. The TTP will be transmitted.  LTP (eventually reassembled) with a size greater than EMTU_R cannot be handled by the egress node and will not be transmitted.
-Note that in this case and unless specified explicitly the link considered is the physical link between the ingress and egress node.
-
+* A TLP smaller than the LMAP is forwarded without fragmentation.
+* A TLP larger than the LMAP but smaller than the EMTU_R is fragmented and reassembled; the TTP is transmitted.
+* A TLP (potentially reassembled) larger than the EMTU_R cannot be processed by IPsec and is dropped.
 
 ~~~
           TMAP              TMTU
@@ -145,41 +184,40 @@ Note that in this case and unless specified explicitly the link considered is th
 |         |encap              |encap
 |         |<--->|             |<--->|
 | No frag. (1)  |  Fragmentation    |
-|               |  (2) Mid-tunnel   |  Packet To Big
+|               |  (2) Mid-tunnel   |  Packet Too Big
 |               |  (4) Outer        |
 +---------------+-------------------+--------> IPsec encapsulated TTP
               LMAP                EMTU_R
 ~~~
-{: #fig-esp-frag title="Fragmentation and Packet Too Big as a function of the TTP size or LTP size. encap designates the IPsec overhead." }
+{: #fig-esp-frag title="Fragmentation and Packet Too Big as a function of TTP/TLP size. 'encap' designates the IPsec overhead." }
 
-This document enables a egress node to inform the ingress node that:
+This document enables the egress node to inform the ingress node that:
 
-* a received packet is fragmented (via an IKE LMAP notification)
-* a packet received is too big to be processed by IPsec (via an IKE PTB notification)
+* a received TLP has been fragmented (via an LMAP notification), and
+* a received TLP is too large to be processed by IPsec (via a PTB notification).
 
-As depicted in {{fig-overview}}, by supporting this extension, the ingress and egress node commit themselves in optimizing the processing of the IPsec tunnel and in limiting reassembly operation being performed at the egress node.
-More specifically, the ingress security gateway limits as much as possible the use of outer fragmentation and commits to set their TMTU value so that TTP are not fragmented/reassembled.
-In addition, for TTP with IPv4 addresses and DF=0, the ingress node commits to perform inner fragmentation to prevent reassembly at the egress node.
+As depicted in {{fig-overview}}, by supporting this extension the ingress and egress nodes cooperate to minimize reassembly at the egress node.
+The ingress node limits the use of outer fragmentation and sets its TMTU so that TTP are not subject to fragmentation or reassembly.
+For TTP with IPv4 addresses and DF=0, the ingress node performs inner fragmentation (3) to prevent reassembly at the egress node.
 
-The mechanism is especially useful when the tunnel between the ingress and egress nodes is using IPv4 outer IP addresses with DF=0 as the fragmentation may occur while the ingress may not be aware of it.
+The mechanism is especially useful when the tunnel outer IP addresses are IPv4 with DF=0, as mid-tunnel fragmentation may occur without the ingress node being aware of it.
 
-The mechanisms enables also enable to inform the IPsec encapsulated TTP is too large and cannot be processed by IPsec. A LTP packet may be to big if it exceeds the LMTU or the EMTU_R. When one of these boundaries is exceeded, both are returned to the ingress node so, the ingress node can clearly understand why the packet has been dropped.   
+The PTB notification also addresses the case where a TLP exceeds the EMTU_R.
+A TLP may exceed the EMTU_R even when individual fragments are within the LMTU: with IPv4 DF=0, the egress node may receive fragments that individually fit within the LMTU (and thus do not trigger ICMP PTB) but reassemble into a packet that exceeds the EMTU_R.
+Similarly, the LMTU of the network may exceed the processing capacity of the IPsec hardware.
 
-A packet may meet the LMTU requirement, but may not meet the EMTU_R requirement.   
- With IPv4 outer IP addresses with DF=0, the egress Security Gateway may receive a serie of fragments that individually do not exceed the MTU (and as such do not generate any LTP ICMP PTB) reassemble a fragmented IPsec encapsulated. That reassembled packet may exceed the size to be processed by IPsec.
-Similarly, even without fragmentation, the LTP MTU may exceed the capacity of the IPsec hardware in which case a IPsec encapsulated may not generate a LTP ICMP PTB but may not be further processed.
-Even though MTU values may be sent via a LTP ICMP PTB message, we do envision that the communication of the LMTU via an IKE notification may provide some advantages over simply relying on LTP ICMP messages. 
-However, please note these advantages are only secondary and only mentioned here as an information.
-At first the IKE channel is authenticated channel that ensures the LMTU is 1) received by the ingress Security Gateway, 2) is integrity protected and 3) can be appropriately bound to the corresponding SA. An ICMP PTB message when sent from the egress Security Gateway is not protected and when UDP encapsulation is used (see {sec-sec}) and may not carry the SPI of the IPsec encapsulated TTP (see {sec-df1}). However, these advantages are only provided by the egress interface and so that mechanism cannot be used by any other node, and so cannot be used for PMTU discovery.
-Secondly, the IKE notification MAY be sent together with the TTP ICMP PTB sent by the router. This may improve the network latency and optimizes the use of the security gateway resources, especially when the SA has been set for multiple Sources. In fact the TTP ICMP PTB sent by the egress router is sent specifically to the sending source, and so one can expect the ICMP PTB being sent to every source. By sending the notification via IKE, the information is received by the ingress Security Gateway which can take action globally for all Sources associated to the SA. This prevents the large packet greater than the MTU to be encrypted and sent to the egress router for nothing.
+Although the LMTU values may also be conveyed via ICMP PTB messages, communicating them via IKEv2 notifications may provide some additional advantages.
+The IKE notification MAY be sent together with the TTP ICMP PTB sent by the router.
+This may improve the network latency and optimize the use of the security gateway resources, especially when the SA has been set for multiple Sources.
+The TTP ICMP PTB sent by the egress router is sent specifically to the sending source, and so one can expect the ICMP PTB being sent to every source.
+By sending the notification via IKE, the information is received by the ingress Security Gateway which can take action globally for all Sources associated to the SA.
+This prevents large packets greater than the MTU from being encrypted and sent to the egress router unnecessarily.
+However, these advantages are only secondary and are only provided by the egress interface; the mechanism cannot be used by any other node and so cannot be used for PMTU discovery.
+This document does not discuss these optimizations further.
 
-This document does not discuss these optimizations.
- 
+## Illustrative Example
 
-## Illustrative example
-
-This section describes an illustrative example to provide a high level overview.
-
+{{fig-overview}} provides a high-level overview of the mechanism.
 
 ~~~
 Source          Security             Security             Destination
@@ -191,8 +229,8 @@ Sender       (Ingress node)        (Egress node)          Receiver
 +--+  routers    +---+    routers      +---+  routers     +---+
                   <--------------------->
                             N
-1) Mid-tunnel (performed by a router on N)
-  (only for IPv4 DF=0  TLP)
+1) Mid-tunnel fragmentation (performed by a router on N)
+  (only for IPv4 DF=0 TLP)
                          +---+---+---+---+---+--+
                          |IPi|IPe|ESP|IPs|IPd|Da| (TLP)
                          +---+---+---+---+---+--+
@@ -201,35 +239,26 @@ Sender       (Ingress node)        (Egress node)          Receiver
                      +---+---+--+
 
 2) Egress node detects fragmentation
-     - a) it collects IPVersion the IP version of the first fragment
-         as well as FragLen, the fragment length
-     - b1) If all segments can be reassembled and the reassembled
-         packet is properly decrypted a Link Maximum Atomic
-         Packet Notification (LMAP) is sent on the IKEv2 channel.
+     - a) It records IPVersion (the IP version of the first fragment)
+          and FragLen (the fragment length).
+     - b) It reassembles the TLP and performs IPsec decapsulation
+          (decryption and integrity verification).
+     - c1) If decapsulation succeeds and the reassembled TLP does
+           not exceed the EMTU_R, the egress node sends an LMAP
+           notification on the IKEv2 channel:
           [IKEv2]
-          <---  N( LMAP [ IPVersion, FragLen] )
-     - b2) If the packet is too big and cannot be fully processed, an
-         additional Packet Too Big Notification (PTB) that specifies
-         the Link MTU (LMTU) of the router component of the egress
-         node (on network N) as well as the effective MTU to receive
-         (EMTU_R). Both are configuration parameters.
-         An ICMP PTB message may also be sent by the egress node.
-         This is considered as independent from the fact that the 
-         egress Security Gateway is sending an IKE PTB or not.
-         Note that this ICMP may not contain even the SPI, and so is
-         likely to not carry sufficient information to the ingress node,
-         so any action be taken.
+          <---  N( LMAP [ IPVersion, FragLen ] )
+     - c2) If the reassembled TLP exceeds the EMTU_R and cannot
+           be fully processed, the egress node sends both an LMAP
+           notification and a PTB notification:
           [IKEv2]
-          <---  N( LMAP [ IPVersion, FragLen] )
-                N( PTB [LMTU, EMTU_R]
-          [ESP]
-          <--- ESP( ICMP PTB )
+          <---  N( LMAP [ IPVersion, FragLen ] )
+                N( PTB [ LMTU, EMTU_R ] )
 
-3) Upon receiving the LMAP or optionally the ingress node
-  a) Update the TMTU so that the Source performs source fragmentation
-    with TTP packets that are not fragmented.
-  Source fragmentation
-  (IPv6 or IPv4)
+3) Ingress node adjusts its TMTU
+  a) Sets TMTU to TMAP so the Source performs source fragmentation
+     for TTP packets exceeding TMAP.
+  Source fragmentation (IPv6 or IPv4):
     +---+---+--+
     |IPs|IPd|Da|  (TTP)
     +---+---+--+
@@ -238,10 +267,9 @@ Sender       (Ingress node)        (Egress node)          Receiver
 +---+---+--+
 
 
-  b) Performs inner fragmentation TTP packets that exceeds the TMTU
-    and will generate some fragments.
-  Inner fragmentation (performed by the Ingress node)
-  (only for IPv4 DF=0 TTP)
+  b) Performs inner fragmentation for IPv4 DF=0 TTP packets
+     exceeding TMAP.
+  Inner fragmentation (performed by the Ingress node):
 
                 +---+---+---+---+---+--+
                 |IPi|IPe|ESP|IPs|IPd|Da| (TLP)
@@ -250,7 +278,7 @@ Sender       (Ingress node)        (Egress node)          Receiver
             |IPi|IPe|ESP|IPs|IPd|ta| (TLP)
             +---+---+---+---+---+--+
 
-In both cases the egress node does not proceed to reassembly operations
+In both cases the egress node does not perform reassembly:
                                                 +---+---+--+
                                                 |IPs|IPd|Da|  (TTP)
                                                 +---+---+--+
@@ -259,50 +287,38 @@ In both cases the egress node does not proceed to reassembly operations
                                             +---+---+--+
 
 ~~~
-{: #fig-overview title="Overview mechanism" }
+{: #fig-overview title="Overview of the LMAP and PTB Mechanism" }
 
 
+## Comparison with Related Work
 
-## Related works
+This work differs from {{?I-D.ietf-intarea-tunnels}} in that {{?I-D.ietf-intarea-tunnels}} considers the router component (carrying TTP) and the interface component (handling TLP) as independent.
+In that model, independence of the Tunnel MTU and the link layer MTU is provided by performing outer fragmentation when needed.
+{{!RFC4301}} takes a different view, allowing the router component to adapt to the needs of the interface component.
+In this document, the ingress node adjusts its TMTU based on information from the egress node so that the source sends TTP of an appropriate size.
 
-This work differs from {{?I-D.ietf-intarea-tunnels}} in that {{?I-D.ietf-intarea-tunnels}} which considers the router component - carrying the TTP - and the interface component - handling LTP - independent.
-Independence of the Tunnel MTU (for TTP) and link layer MTU for (LTP) is provided by performing outer fragmentation when needed.
-{{!RFC4301}} takes another view considering the router component can adapt to the specific needs of the interface component.
-In our case, the router MTU can be changed so the source sends PTP of an expected TMAP size.
-Note however, that a significant difference between MPA and MTU is that fragmentation is considered as a normal operation and that ICMP Packet Too Big (PTB) is only expected when the router is not able to handle the packet - that is when the (reassembled) packet exceeds the MTU (or more explicitly the effective MTU to receive (EMTU_R) or the Link MTU (LMTU)).
+A significant difference between LMAP and LMTU is that under this specification, fragmentation is considered a normal (if undesirable) operation, and ICMP PTB is only expected when the egress node cannot process the packet — i.e., when the (reassembled) TLP exceeds the EMTU_R or the LMTU.
 
-The extension described in this document follows {{!RFC8900}}’s recommendations where each layer handles fragmentation at their layer and to reduce the reliance on IP fragmentation to the greatest degree possible.
-This document does not describe a Path MTU Discovery (PMTUD)  procedure {{!RFC1191}} nor an Execute Packetization Layer PMTUD (PLMTUD) {{!RFC4821}} procedure.
-PLMTUD work has been started in {{?I-D.spiriyath-ipsecme-dynamic-ipsec-pmtu}}.
-This document remains focused on providing information on the state of the egress node to the ingress node.
-This Information is fragmentation related and includes the notification that fragmentation is being observed as well as the EMTU_R and LMTU value - which are configuration parameters.
-This document lets the ingress node interpret these pieces of information and take the necessary actions.
-PLMTUD is much more complex especially as IPsec considers multiple channels such as IKE and IPsec protected data and is required to handle black holing scenarios.
-
-Sending LMTU when a too big LTP is received by the egress router is similar to an ICMP PTB except that the message is carried over the IKEv2 channel, and we ensure that sufficient information (like the SPI) is provided to the ingress node so the appropriated traffic selectors can be identified by the ingress node - see {{sec-df1}} for more details.
-EMTU_R is not sent by a LTP ICMP PTB packet. 
+Sending LMTU via the IKEv2 PTB notification is analogous to an ICMP PTB message, except that it is carried over the authenticated IKEv2 channel.
+This ensures that sufficient information (including the SPI) is available to the ingress node to identify the affected traffic selectors (see {{sec-df1}}).
+The EMTU_R is a local parameter of the egress node and is not conveyed by ICMP PTB messages.
 
 
-## Why not using DF=1 to avoid Mid fragmentation ? {#sec-df1}
+## Why Not Use DF=1 to Prevent Mid-Tunnel Fragmentation? {#sec-df1}
 
-One can reasonably question why setting the IPv4 DF=1 is not sufficient to avoid fragmentation.
-While DF=1 avoids fragmentation, it can easily fall into black holing scenarios, unless one can ensure that ICMP PTB messages are effectively received with sufficient information by the ingress node to take appropriate actions.
-This is not the case in practice, which is the reason DF is very commonly set to 0.
+Setting the IPv4 Don't Fragment bit (DF=1) prevents fragmentation but introduces black-hole risks unless ICMP PTB messages are reliably delivered to the ingress node with sufficient information to take corrective action.
+In practice, this is not the case, which is why DF is commonly set to 0.
 
-Suppose the Don't Fragment bit to 1 in the IPv4 Header of the Tunnel Link Packet.
-If that packet becomes larger than the link Maximum Transmission Unit (LMTU), the packet is dropped by an on-path router and an ICMPv4 message Packet Too Big (PTB) {{!RFC0792}} is returned to the sending address.
-The ICMPv4 PTB message is a Destination Unreachable message with Code equal to 4 and was augmented by {{!RFC1191}} to indicate the acceptable MTU.
-Unfortunately, one cannot rely on such a procedure as in practice some routers do not check the MTU and as such do not send ICMPv4 messages.
-In addition, when ICMPv4 messages are sent these messages are unprotected, and may be blocked by firewalls or ignored.
-This results in IPv4 packets being dropped without the security gateways being aware of it which is also designated as black holing.
-To prevent this situation, IPv4 packets often set their DF bit set to 0.
-In this case, as described in {{!RFC0792}}, when a packet size exceeds its MTU, the node fragments the incoming packet in multiple fragments.
+When DF=1 and a TLP exceeds the LMTU of an on-path router, the packet is dropped and an ICMPv4 Destination Unreachable message (Type 3, Code 4) is returned to the source address.
+{{!RFC1191}} augmented this message to include the acceptable MTU.
+However, this procedure is unreliable for the following reasons:
 
-In addition to the above reasons DF=1 is not appropriate for ESP, there is another important reason that ICMP does not work almost completely for ESP.
+* Some routers do not check the MTU and therefore do not generate ICMPv4 messages.
+* ICMPv4 messages are unprotected and may be blocked by firewalls or ignored.
+* This results in packets being silently dropped (black holing).
 
-{{fig-icmpv4}} describes the ICMPv4 PTB as defined in {{!RFC1191}} and to be useful to the ingress node, the ICMP PTB should at least carry the SPI that would identify the incoming traffic associated to that ICMP PTB.
-This information is carried in the “Internet Header + 64 bits of Original Datagram Data” field which in our case carries the tunnel IP header with an additional 8 bytes.
-
+{{fig-icmpv4}} shows the ICMPv4 PTB message format as defined in {{!RFC1191}}.
+The "Internet Header + 64 bits of Original Datagram Data" field carries the outer tunnel IP header plus an additional 8 bytes.
 
 ~~~
  0                   1                   2                   3
@@ -315,26 +331,27 @@ This information is carried in the “Internet Header + 64 bits of Original Data
 |      Internet Header + 64 bits of Original Datagram Data      |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~
-{: #fig-icmpv4 title="ICMP PTB" }
+{: #fig-icmpv4 title="ICMPv4 Packet Too Big Message" }
 
+When ESP is encapsulated in UDP or TCP, these 8 bytes correspond to the transport header rather than the ESP header.
+As a result, the SPI cannot be derived from the ICMP message, and the ingress node cannot identify the affected traffic selector or SA.
 
-When ESP is encapsulated in UDP or TCP, the 8 bytes correspond to the UDP header and the TCP header is even larger. As a result, the SPI cannot be derived from the 8 bytes being provided and the ingress node cannot identify the traffic selector and proceed to the next step.
-
-Note also that when the SPI is identified, the ingress node may not exactly know which Source has generated the ICMP PTB as the SA traffic selector is defined by a range of IP addresses and as such may contain multiple Sources. The Path MTU is propagated to the Source as described in {{!RFC4301, Section 8.2}}, that is to say by by updating the PMTU information of the SA and upon receiving a packet that matches that SA and whose size exceeds the PMTU of the SA, discard that packet and sends back an ICMP PTB message to the Source.
+Even when the SPI is identifiable, the ingress node may not know which specific Source generated the packet, as the SA traffic selector may cover a range of IP addresses.
+The PMTU is propagated to the Source as described in Section 8.2 of {{!RFC4301}}: the ingress node updates the PMTU of the SA and, upon receiving a packet that matches the SA and exceeds the PMTU, discards it and returns an ICMP PTB to the Source.
 
 
 # Requirements Language {#sec2}
 
 {::boilerplate bcp14}
 
-Tunnel, Ingress node, Egress node, Ingress Interface, Egress interface, Tunnel Transit Packets (TTP), Tunnel Link Packet (TLP), Link MTU (LMTU), Tunnel MTU (TMTU), Tunnel maximum atomic packet (TMAP), effective MTU to receive (EMTU_R) are defined in {{?I-D.ietf-intarea-tunnels}}.
+Tunnel, Ingress node, Egress node, Ingress Interface, Egress interface, Tunnel Transit Packet (TTP), Tunnel Link Packet (TLP), Link MTU (LMTU), Tunnel MTU (TMTU), Tunnel Maximum Atomic Packet (TMAP), effective MTU to receive (EMTU_R) are defined in {{?I-D.ietf-intarea-tunnels}}.
 
-# Link Maximum Atomic Packet and Packet Too Big Support Negotiation
 
-During an IKEv2 negotiation, the initiator and the responder indicate their support for the Link Maximum Atomic Packet and Packet Too Big Extension by exchanging the LMAP_AND_PTB_SUPPORTED notifications.
-This notification MUST be sent in the IKE_AUTH exchange (in case of multiple IKE_AUTH exchanges - in the first IKE_AUTH message from initiator and in the last IKE_AUTH message from responder).
-If both the initiator and the responder send this notification during the IKE_AUTH exchange, peers may notify each other with an IPv4 Link Maximum Atomic Packet Notification when fragmentation is observed.
-Upon receiving such notifications, the peers may take the necessary actions to prevent such fragmentation to occur.
+# LMAP and PTB Support Negotiation {#sec-nego}
+
+During an IKEv2 negotiation, the initiator and the responder indicate their support for the Link Maximum Atomic Packet and Packet Too Big Extension by exchanging LMAP_AND_PTB_SUPPORTED notifications.
+This notification MUST be sent in the IKE_AUTH exchange (in case of multiple IKE_AUTH exchanges — in the first IKE_AUTH message from the initiator and in the last IKE_AUTH message from the responder).
+If both the initiator and the responder send this notification during the IKE_AUTH exchange, peers may notify each other with LMAP and PTB notifications when fragmentation or oversized packets are observed.
 
 ~~~
 Initiator                         Responder
@@ -352,30 +369,36 @@ HDR, SK {IDi, AUTH,
 
 # Sending a Link Maximum Atomic Packet Notification {#sec-send-lmap}
 
-The egress security gateway detects fragmentation occurred when it receives an initial fragment; e.g. with the Flags' More Fragment Bit set to 1 and the Fragment Offset set to 0.
-Upon receiving such a packet, the egress node determines the IP version (IPVersion) and the fragment length FragLen).
-For an IPv4 packet, FragLen is the Total Length field (see {{!RFC0791}}).
-For an IPv6 packet FragLen is the Payload Length (see {{!RFC8200, Section 3}}.
-Note that these values have different meanings as with an IPv6 fragment, FragLen does not include the IPv6 header but only the payload.
+The egress security gateway detects that fragmentation has occurred when it receives an initial fragment — i.e., an IP packet with the More Fragments (MF) flag set to 1 and the Fragment Offset set to 0.
 
-The egress node sends the LMAP notification payload that contains IPVersion and FragLen.
+Upon receiving such a fragment, the egress node records:
 
-The egress node SHOULD send a maximum of one LMAP notification per (reassembled) received packet.
-However, since this extension is especially expected on nodes dealing with high traffic rates, the notification is expected to be sent at reasonable rates per Security Associations.
-More specifically, the use of the IKEv2 provides a reliable channel which makes sending redundant notifications unnecessary.
-Then, the notification rate needs to account for the time the egress node adjusts the TMTU, and that TMTU remains implemented.
-More details are provided in {{sec-sec}}.
+* IPVersion: the IP version of the fragment (4 or 6).
+* FragLen: for an IPv4 packet, the Total Length field (see {{!RFC0791}});
+  for an IPv6 packet, the Payload Length field (see {{!RFC8200, Section 3}}).
+  Note that these values have different semantics: for IPv6, FragLen does not include the 40-byte IPv6 header.
+
+The egress node MUST NOT send the LMAP notification until the reassembled packet has been successfully decapsulated (decrypted and integrity-verified).
+This ensures that off-path attackers cannot inject forged fragments to trigger spurious notifications (see {{sec-sec}}).
+
+The egress node then sends the LMAP notification containing IPVersion and FragLen.
+
+The egress node SHOULD send a maximum of one LMAP notification per reassembled received packet.
+However, since this extension is especially intended for nodes handling high traffic rates, the notification rate SHOULD be limited per Security Association (see {{sec-sec}} for rate-limiting guidance).
+The IKEv2 channel provides reliable delivery, making redundant notifications unnecessary.
+The notification rate also needs to account for the time the ingress node requires to adjust its TMTU and for the adjusted TMTU to take effect.
 
 
 ~~~
 Egress Security Gateway                 Ingress Security Gateway
 -------------------------------------------------------------------
-HDR SK { N(LMAP)} -->
+HDR SK { N(LMAP) } -->
 ~~~
+
 
 # Receiving a Link Maximum Atomic Packet Notification {#sec-recv-lmap}
 
-Upon receiving a LMAP notification, the ingress node derives the tunnel MAP (TMAP) from the Link MAP (LMAP) derived by the FragLen and IPVersion.
+Upon receiving an LMAP notification, the ingress node derives the Tunnel Maximum Atomic Packet (TMAP) from the Link Maximum Atomic Packet (LMAP), which is derived from the FragLen and IPVersion fields.
 
 ~~~
 if IPVersion is 4:
@@ -386,43 +409,44 @@ TMAP = LMAP - outer IP header - encapsulation overhead
 ~~~
 {: #fig-tmap title="Computation of TMAP" }
 
-where
+where:
+
 IPVersion:
 : The IP version of the fragment provided by the LMAP notification (see {{sec-send-lmap}}).
 
 FragLen:
-: The Fragment length provided by the LMAP notification (see {{sec-send-lmap}}).
+: The fragment length provided by the LMAP notification (see {{sec-send-lmap}}).
 
 LMAP:
-: For an IPv4 packet, LMAP is directly provided by the fragment length of the LMAP Notification.
-For an IPv6 packet, LMAP needs to adds the IPv6 Header length (40 bytes) to the fragment length of the LMAP Notification.
+: For an IPv4 packet, LMAP equals FragLen directly.
+For an IPv6 packet, LMAP equals FragLen plus the IPv6 header length (40 bytes).
 
 outer IP header:
-: The IP header of the LTP
+: The IP header of the TLP.
+
 encapsulation overhead:
- contains the ESP header, the ESP Trailer including the variable Pad field.
-When the padding is minimizing the Pad Len, the encapsulation header is set to 14 (+ the size of the ICV).
-The overhead SHOULD also estimate IP options or IP extensions.
+: The ESP header plus the ESP Trailer including the variable Pad field.
+When minimizing padding, the encapsulation overhead is 14 bytes plus the size of the ICV.
+The overhead SHOULD also account for IP options or IPv6 extension headers.
 
-The ingress security gateway SHOULD propagate the TMAP as the tunnel MTU back to the Source so the size of future TTP packets does not exceed the TMAP - eventually performing source fragmentation.
-To do so, the ingress node sets the LMTU to TMAP for all traffic designated by the SA.
-In this case the LMTU is the MTU associated with the link of the router interface of the ingress node that faces the Source's network.
-Upon receiving a TLP larger than the TMAP, the packet is discarded and an ICMP PTB message is returned to the Source which then performs Source Fragmentation (5) (See Section 8.2.1. of {{!RFC4301}}).
-It is worth mentioning that only future packets will be impacted, and not those causing fragmentation.
+The ingress security gateway SHOULD propagate the TMAP as the Tunnel MTU back to the Source so that the size of future TTP does not exceed the TMAP — performing source fragmentation (5) if necessary.
+To do so, the ingress node sets the TMTU to TMAP for all traffic designated by the SA.
+Upon receiving a TTP larger than the TMAP, the ingress node discards the packet and returns an ICMP PTB message to the Source, which then performs source fragmentation (see Section 8.2.1 of {{!RFC4301}}).
+Only future packets are affected; packets that caused the fragmentation are not retroactively changed.
 
-When the TLP is an IPv4 packet with DF=0, the ingress node SHOULD perform Source Fragmentation of the TTP, also represented as Inner Fragmentation (3), sending chunks that do not exceed TMAP.
+When the TTP is an IPv4 packet with DF=0, the ingress node SHOULD perform inner fragmentation (3) of TTP that exceed the TMAP, sending fragments that do not exceed the TMAP.
 
-Figure 11 in Section 4.2.2 of {{?I-D.ietf-intarea-tunnels}} with tunnel MTU set to TMAP achieves both recommendations, while Figure 12 in Section 4.2.2 describes the inner fragmentation.
+Figure 11 in Section 4.2.2 of {{?I-D.ietf-intarea-tunnels}} with Tunnel MTU set to TMAP achieves both recommendations, while Figure 12 in Section 4.2.2 describes inner fragmentation.
 
 
 # Sending a Packet Too Big Notification {#sec-send-ptb}
 
-A packet can be rejected because the size of the LTP exceeds the LMTU (of the router component) or when the (reassembled) LTP exceeds the EMTU_R (of the interface component) and so IPsec decapsulation cannot be done.
+A TLP is rejected when its size exceeds the LMTU of the egress router component or when the (reassembled) TLP exceeds the EMTU_R of the egress interface component, preventing IPsec decapsulation.
 
-When the LTP size exceeds the EMTU_R, the egress node SHOULD send a Packet Too Big (PTB) notification that includes the EMTU_R and the LMTU.
-In addition, if the packet results from a reassembly operation, the egress node MUST send a LMAP notification with the LMAP.
-If the packet does not result from a reassembly operation, the egress node MUST NOT send a LMAP notification.
+When the TLP size exceeds the EMTU_R, the egress node SHOULD send a Packet Too Big (PTB) notification that includes both the EMTU_R and the LMTU.
 
+If the oversized TLP resulted from reassembly, the egress node MUST also send an LMAP notification with the observed LMAP.
+If the TLP did not result from reassembly, the egress node MUST NOT send an LMAP notification.
 
 ~~~
 Egress Security Gateway                 Ingress Security Gateway
@@ -430,40 +454,70 @@ Egress Security Gateway                 Ingress Security Gateway
 HDR SK { N(PTB) } -->
 ~~~
 
-# Receiving a Packet Too Big Notification
 
-Upon receiving a PTB notification, the egress node computes the Tunnel MTU (TMTU) as follows:
+# Receiving a Packet Too Big Notification {#sec-recv-ptb}
+
+Upon receiving a PTB notification, the ingress node computes the Tunnel MTU (TMTU) as follows:
 
 ~~~
 TMTU = EMTU_R - outer IP header - encapsulation overhead
-if LMAP notification is not received:
+if LMAP notification is also received:
   TMAP is derived from the LMAP notification
 else:
   TMAP = LMTU - outer IP header - encapsulation overhead
 TMAP = min( TMAP, TMTU )
-
 ~~~
 {: #fig-tmtu title="Computation of TMTU" }
 
 with the same notation as in {{fig-tmap}}:
+
 EMTU_R:
-: The value provided in the PTB notification related to the MTU associated to the egress interface (see {{sec-send-ptb}})
+: The value provided in the PTB notification, representing the maximum packet size the egress interface can accept for IPsec processing (see {{sec-send-ptb}}).
 
-LMTU :
-: The value provided in the PTB notification related to the LMTU associated to the egress router (see {{sec-send-ptb}})
+LMTU:
+: The value provided in the PTB notification, representing the Link MTU of the egress router (see {{sec-send-ptb}}).
 
-The ingress node SHOULD proceed with TMAP as described in {{sec-recv-lmap}}.
+The ingress node SHOULD handle TMAP as described in {{sec-recv-lmap}}.
 
-The ingress node MUST ensure the size of the TTP do not exceed the computed TMTU and MUST ensure the size of the LTP do not exceed the LMTU provided in the PTB notification.
+The ingress node MUST ensure the size of the TTP does not exceed the computed TMTU and MUST ensure the size of the TLP does not exceed the LMTU provided in the PTB notification.
 
-# Payload Description
 
-{{fig:notify}} illustrates the Notify Payload packet format as described in Section 3.10 of {{RFC7296}} with a 4 bytes path allowed MTU value as notification data.
-This format is used for both the LMAP_AND_PTB_SUPPORTED, LMAP and PTB notifications.
+# TMTU Increase {#sec-tmtu-increase}
+
+The mechanisms described in {{sec-recv-lmap}} and {{sec-recv-ptb}} enable the ingress node to reduce its TMTU in response to fragmentation or oversized packet notifications.
+This section describes how the ingress node may subsequently increase the TMTU when path conditions improve.
+
+The ingress node maintains a timestamp recording when the most recent LMAP or PTB notification was received for each SA.
+If no LMAP or PTB notification is received for a configurable period (the "TMTU aging interval"), the ingress node MAY gradually increase the TMTU toward the configured maximum TMTU for the SA.
+
+The increase is performed using real data traffic rather than dedicated probe packets.
+Since fragmentation and reassembly remain a viable (if costly) fallback, the ingress node can increase the TMTU incrementally and rely on the egress node to send a new LMAP notification if fragmentation recurs at the new size.
+This approach avoids the need for a dedicated probing protocol.
+
+The following procedure is RECOMMENDED:
+
+1. The ingress node maintains a "TMTU aging interval" (a configurable duration).
+
+2. When the aging interval expires without any LMAP or PTB notification being received for the SA, the ingress node increases the TMTU by a configurable increment, up to the configured maximum TMTU.
+
+3. If a new LMAP or PTB notification is received after the increase, the ingress node immediately reduces the TMTU as specified in {{sec-recv-lmap}} or {{sec-recv-ptb}} and resets the aging timer.
+
+4. The increase MUST be validated over a sustained period.
+   The ingress node SHOULD NOT increase the TMTU again until the current increased TMTU has been in effect for at least one full aging interval without triggering a new notification.
+   This addresses scenarios where misconfigured ECMP causes inconsistent path behavior: a single successful transmission at a larger size does not confirm that all paths support that size.
+
+This mechanism is intentionally simple: it leverages the existing LMAP feedback loop rather than introducing a separate PLPMTUD-style probing protocol.
+A full PLPMTUD procedure for IPsec is a more complex undertaking (see {{?I-D.spiriyath-ipsecme-dynamic-ipsec-pmtu}}) and is out of scope for this document.
+
+
+# Payload Description {#sec-payload}
+
+{{fig-notify}} illustrates the Notify Payload packet format as described in Section 3.10 of {{!RFC7296}}.
+This format is used for the LMAP_AND_PTB_SUPPORTED, LMAP, and PTB notifications.
 
 ~~~
-1                   2                   3
-0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | Next Payload  |C|  RESERVED   |         Payload Length        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -474,42 +528,47 @@ This format is used for both the LMAP_AND_PTB_SUPPORTED, LMAP and PTB notificati
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~
-{: #fig:notify title="Notify Message Format"}
+{: #fig-notify title="Notify Message Format" }
 
-The fields Next Payload, Critical Bit, RESERVED and Payload Length are defined in {{!RFC7296}}. Specific fields defined in this document are:
+The fields Next Payload, Critical Bit, RESERVED, and Payload Length are defined in {{!RFC7296}}.
+Specific fields defined in this document are:
 
 Protocol ID (1 octet):
-: set to zero.
+: Set to zero.
 
 SPI Size (1 octet):
-: set to zero.
+: Set to zero.
 
 Notify Message Type (2 octets):
-: Specifies the type of notification message. It is set to TBD1 for the LMAP_AND_PTB_SUPPORTED notification, TBD2 for the LMAP notification and TBD3 for the PTB notification.
+: Specifies the type of notification message.
+It is set to TBD1 for the LMAP_AND_PTB_SUPPORTED notification, TBD2 for the LMAP notification, and TBD3 for the PTB notification.
 
 Notification Data:
-: Specifies the data associated to the notification message. It is empty for the LMAP_AND_PTB_SUPPORTED notification or a 4 octets that contains the MTU value for the LMAP and PTB notification - as represented in {{fig:LMAP_data}} and {{fig:PTB_data}}.
+: Specifies the data associated with the notification message.
+It is empty for the LMAP_AND_PTB_SUPPORTED notification.
+For the LMAP notification, it is 4 octets as defined in {{fig-LMAP-data}}.
+For the PTB notification, it is 8 octets as defined in {{fig-PTB-data}}.
 
 ~~~
+ 0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |IPVers |       Reserved        |          FragLen              |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~
-{: #fig:LMAP_data title="Notification Data for LMAP"}
-
-with:
+{: #fig-LMAP-data title="Notification Data for LMAP" }
 
 IPVersion (4 bits):
-: The IPversion of the received packet
+: The IP version of the received fragment.
 
-Reserved:
-: Reserved bytes MUST be set by the egress node to zero and MUST be ignored by the ingress node.
+Reserved (12 bits):
+: MUST be set to zero by the sender and MUST be ignored by the receiver.
 
-FragLen (2 bytes):
-: The FragLen value (see {{sec-send-lmap}})
+FragLen (2 octets):
+: The fragment length as defined in {{sec-send-lmap}}.
 
 ~~~
+ 0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                         LMTU                                  |
@@ -517,70 +576,86 @@ FragLen (2 bytes):
 |                        EMTU_R                                 |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ~~~
-{: #fig:PTB_data title="Notification Data for PTB"}
+{: #fig-PTB-data title="Notification Data for PTB" }
 
-with:
+LMTU (4 octets):
+: The Link MTU of the egress router.
 
-LMTU (4 bytes):
-: The LMTU of the egress router
+EMTU_R (4 octets):
+: The effective MTU to receive of the egress interface.
 
-EMTU_R (4 bytes):
-: The EMTU_R of the egress interface
 
 # IANA Considerations
 
-IANA is requested to allocate two values in the "IKEv2 Notify Message Types - Status Types" registry
-(available at https://www.iana.org/assignments/ikev2-parameters/ikev2-parameters.xhtml#ikev2-parameters-16) with the following definition:
+IANA is requested to allocate three values in the "IKEv2 Notify Message Types - Status Types" registry (available at https://www.iana.org/assignments/ikev2-parameters/ikev2-parameters.xhtml#ikev2-parameters-16) with the following definitions:
 
-~~~
-+=======+================================+
-| Value | NOTIFY MESSAGES - STATUS TYPES |
-+=======+================================+
-| TBD1  | LMAP_AND_SUPPORTED             |
-| TBD2  | LMAP                           |
-| TBD3  | PTB                            |
-+-------+--------------------------------+
-~~~
+| Value | Notify Message Type   |
+|-------|-----------------------|
+| TBD1  | LMAP_AND_PTB_SUPPORTED |
+| TBD2  | LMAP                  |
+| TBD3  | PTB                   |
+
 
 # Security Considerations {#sec-sec}
 
-This document defines an IKEv2 extension to enable an egress node to notify an ingress node that fragmentation is happening as well as the observed fragment length.
-In addition, the extension also enables an egress node to notify an ingress node that a packet too big has been discarded, together with some complementary information to appropriately update the MTU.
+## Authentication and Trust Model
 
-These pieces of information are transferred over the authenticated IKEv2 channel which ensures the origin of the message.
-Assuming the egress node is trusted, the ingress node can trust what is being reported effectively observed (like fragmentation is happening, the observed fragment length, a packet too big has been received) by the egress node and that some information are effectively accurate such as the egress LMTU and EMTU_R.
-When fragmentation happens and a LMAP notification is being sent, the egress node MUST send the notification once the reassembled packet has been decapsulated.
-This ensures that fragmentation has been performed over an authenticated TLP and ensures the TLP has not been forged by any attacker.
-With IPv6, only outer fragmentation is permitted so, the ingress node can validate the provided information.
-However, sending the notification after the IPsec decapsulation enables the egress node to detect potential injection attacks and prevent sending an unnecessary notification, that may be part of a DDoS attack targeting the ingress node itself.
-With IPv4 an attacker could set the DF=0 which would allow any mid tunnel fragmentation.
-IPsec (ESP or AH) does not cover the DF flag, so the egress cannot trust the fragment length observed has not been forged, and the security considerations related to MTU discovery {{!RFC0791}}, {{!RFC8900}}, {{?RFC4963}}, {{!RFC6864}}, {{!RFC1191}} apply here.
-Note that information carried by the LMAP notification is never carried by ICMP, and all LMAP may share with ICMP is that this information will be used to update the MTU.
+The LMAP and PTB notifications defined in this document are carried over the authenticated IKEv2 channel, which ensures the origin and integrity of the messages.
+Assuming the egress node is trusted, the ingress node can trust the following:
 
-The egress node may not be able to decrypt the encrypted TTP packet if the full encrypted TTP cannot be built.
-One possibility is that too many fragments are being sent over a too long period of time (slowloris-like attacks) (see {{!RFC8900, Section 3.7}}).
-Another possibility is that one fragment exceeds the LMTU or that the reassembled (unverified) encrypted TTP exceeds the EMTU_R.
-In both cases, a PTB notification SHOULD be sent and if fragmentation is observed a LMAP MUST be sent together with the PTB notification.
-Information carried by the PTB (LMTU and EMTU_R) can be trusted.
-Without this extension this information would have been carried by ICMP.
-In many deployments, the ICMP channel may be unprotected and ICMP packets may be discarded by firewalls and never reach the egress node.
-In addition, the description provided by {{?I-D.ietf-intarea-tunnels}} tends to indicate that the ICMP channel remains between the router components of the ingress and egress nodes and as such are not provided to the interfaces component.
-Finally, as detailed in {{sec-df1}} an ICMP PTB message contains a portion of the encrypted ESP packet, which may not sufficient to deduce the SPI and associated traffic selectors, and as such prevent the ingress node to identify the traffic flow that generates the fragmentation.
-In any case, this results in the information not being available to take the appropriate action.
-Sending the PTB notification over ICMP solves these issues and eases the correlation with the LMAP notification.
-In terms of trust, when sufficient information may be sent both on the IKEv2 channel and via a protected ICMP PTB message, the use of the PTB notification achieves similar trust as the one observed with an ICMP PTB message sent over an IPsec protected channel.
-For that reason, the ICMP messages SHOULD be protected by IPsec.
-The use of two different paths may provide some additional reliability as the same information is taking two different paths and that IKEv2 windows ensures the the information is received - as opposed to the (encrypted) ICMP message that can be dropped.
-However, information carried by the LMAP notification cannot be trusted and similar security considerations related to MTU discovery {{!RFC0791}}, {{!RFC8900}}, {{?RFC4963}}, {{!RFC6864}}, {{!RFC1191}} apply here.
+* That fragmentation was actually observed (LMAP notification).
+* That the fragment length reported is what the egress node received.
+* That the LMTU and EMTU_R values are the actual configuration parameters of the egress node (PTB notification).
 
+Any ICMP PTB messages that the egress node may independently generate are a separate mechanism.
+This specification does not rely on ICMP PTB messages for conveying LMTU or EMTU_R information.
+The ICMP messages SHOULD be protected by IPsec when possible, but their delivery is not required for the correct operation of this extension.
 
-During high packet rates, this notification for each of these packets is likely to be used by an attacker to trigger a DDoS attack to both egress and ingress nodes.
-As a result, the egress node SHOULD be able to configure the maximum rate at which the notifications are sent.
-This includes the ability to indicate that LMAP notifications (without PTB) are not sent when the outer IP addresses are of version IPv6.
-The reasoning is that with IPv6, the egress node observes outer fragmentation, in which case the ingress node is already aware of it.
-In addition, an egress node SHOULD be able to configure a threshold for number of alerts per SAs before a notification is sent, a rate limit per SA.
+## LMAP Notification Integrity
+
+The egress node MUST send the LMAP notification only after the reassembled packet has been successfully decapsulated (IPsec decryption and integrity verification).
+This requirement, specified normatively in {{sec-send-lmap}}, ensures that:
+
+* Off-path attackers cannot inject forged fragments to trigger spurious notifications.
+* The notification reflects fragmentation of a legitimate, authenticated TLP.
+
+With IPv6, only outer fragmentation (performed by the ingress node) is permitted, so the ingress node can validate the reported information against its own fragmentation decisions.
+
+With IPv4 (DF=0), an on-path attacker could re-fragment a legitimate ESP packet, since ESP and AH do not protect the DF flag or the fragment offset fields.
+In this case, the egress node would observe fragmentation of an authenticated packet, and the LMAP notification would correctly reflect the actual link conditions.
+The standard security considerations related to IPv4 fragmentation and MTU discovery ({{!RFC0791}}, {{!RFC8900}}, {{?RFC4963}}, {{!RFC6864}}, {{!RFC1191}}) apply.
+
+## PTB Notification Trust
+
+The LMTU and EMTU_R values in the PTB notification are local configuration parameters of the egress node, communicated over the authenticated IKEv2 channel.
+The trust level is fundamentally stronger than ICMP PTB messages, which are unprotected and may be spoofed or modified.
+
+When sufficient information is available both on the IKEv2 channel and via a protected ICMP PTB message (encrypted within the IPsec tunnel), the IKEv2 PTB notification provides equivalent or stronger trust guarantees.
+The use of two different channels (IKEv2 and encrypted ICMP) may provide additional reliability, as IKEv2 windowing ensures the information is received.
+
+## Rate Limiting and Denial of Service
+
+During high packet rates, generating a notification for every fragmented or oversized packet could be exploited by an attacker to trigger a denial-of-service attack targeting both the egress and ingress nodes.
+The following mitigations are RECOMMENDED:
+
+* The egress node SHOULD be configurable with a maximum notification rate per SA.
+* The egress node SHOULD support a configurable threshold for the number of fragmentation events per SA before a notification is sent.
+* The egress node SHOULD be configurable to suppress LMAP notifications (without PTB) when the tunnel outer IP addresses are IPv6.
+  With IPv6, only outer fragmentation is possible, and the ingress node is already aware of it.
+
+## TMTU Increase and ECMP Considerations
+
+The TMTU increase mechanism described in {{sec-tmtu-increase}} uses real data traffic rather than dedicated probe packets.
+Misconfigured ECMP may cause different paths between the tunnel endpoints to have different MTU values.
+A single successful transmission at a larger size does not guarantee that all ECMP paths support that size.
+For this reason, the ingress node MUST validate the increased TMTU over a sustained period (at least one full aging interval) before further increases.
+See {{sec-tmtu-increase}} for the detailed procedure.
 
 
 # Acknowledgements
 
-The authors would like to thank Magnus Westerlund, Paul Wouters, Joe Touch, Tero Kivinen for his reviews and valuable comments and suggestions.
+The authors would like to thank Gorry Fairhurst, Magnus Westerlund, Paul Wouters, Joe Touch, and Tero Kivinen for their reviews and valuable comments and suggestions.
+
+
+--- back
+
